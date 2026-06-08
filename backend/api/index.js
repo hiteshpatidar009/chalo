@@ -80,8 +80,14 @@ const authMiddleware = (req, res, next) => {
 
 // ========== ROUTES ==========
 
-// Root endpoint
-app.get('/', (req, res) => {
+// Debug logging for incoming requests
+app.use((req, res, next) => {
+  console.log(`[${req.method}] ${req.path}`);
+  next();
+});
+
+// Root endpoint (both / and /api)
+app.get(['/', '/api', '/api/'], (req, res) => {
   res.json({ 
     message: 'Chalo Backend API ✅',
     version: '1.0.0',
@@ -89,8 +95,8 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check
-app.get('/health', (req, res) => {
+// Health check (both /health and /api/health)
+app.get(['/health', '/api/health'], (req, res) => {
   res.json({
     status: 'ok',
     environment: process.env.NODE_ENV || 'production',
@@ -102,7 +108,7 @@ app.get('/health', (req, res) => {
 
 // ========== AUTH ROUTES ==========
 
-app.post('/auth/register', async (req, res) => {
+app.post(['/auth/register', '/api/auth/register'], async (req, res) => {
   try {
     await connectDB();
     if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
@@ -125,7 +131,7 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post(['/auth/login', '/api/auth/login'], async (req, res) => {
   try {
     await connectDB();
     if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
@@ -172,7 +178,7 @@ function generateQRToken(userId, ticketId, secret) {
   return { qrData: `${payloadB64}.${sig}`, payload, expiresIn: WINDOW_SECONDS };
 }
 
-app.post('/qr/generate', authMiddleware, (req, res) => {
+app.post(['/qr/generate', '/api/qr/generate'], authMiddleware, (req, res) => {
   try {
     if (!QR_HMAC_SECRET) throw new Error('QR_HMAC_SECRET not configured');
     const { ticketId = 'AICTSL-PASS-001' } = req.body;
@@ -184,7 +190,7 @@ app.post('/qr/generate', authMiddleware, (req, res) => {
   }
 });
 
-app.post('/qr/verify', authMiddleware, async (req, res) => {
+app.post(['/qr/verify', '/api/qr/verify'], authMiddleware, async (req, res) => {
   try {
     await connectDB();
     if (!QR_HMAC_SECRET) throw new Error('QR_HMAC_SECRET not configured');
@@ -212,12 +218,23 @@ app.post('/qr/verify', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/qr/secret', authMiddleware, (req, res) => {
+app.get(['/qr/secret', '/api/qr/secret'], authMiddleware, (req, res) => {
   if (!QR_HMAC_SECRET) return res.status(500).json({ error: 'QR_HMAC_SECRET not configured' });
   res.json({ hmacSecret: QR_HMAC_SECRET });
 });
 
 // ========== ERROR HANDLERS ==========
+
+// 404 handler - log and respond
+app.use((req, res) => {
+  console.log(`[404] ${req.method} ${req.path} - Route not found`);
+  res.status(404).json({ 
+    error: 'Route not found', 
+    path: req.path,
+    method: req.method,
+    message: 'Available endpoints: GET /health, POST /auth/register, POST /auth/login, POST /qr/generate, POST /qr/verify, GET /qr/secret'
+  });
+});
 
 // Global error handler
 app.use((err, req, res, next) => {
@@ -226,11 +243,6 @@ app.use((err, req, res, next) => {
     error: err.message || 'Internal Server Error',
     timestamp: new Date().toISOString()
   });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found', path: req.path });
 });
 
 module.exports = app;
