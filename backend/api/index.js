@@ -3,10 +3,24 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 
+// Check required env vars immediately
+const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET', 'QR_HMAC_SECRET'];
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+
+if (missingVars.length > 0) {
+  console.error('❌ MISSING ENV VARIABLES:', missingVars);
+  console.log('Please set these in Vercel Settings → Environment Variables');
+}
+
 // Models and routes
-const User = require('../models/User');
-const ScannedToken = require('../models/ScannedToken');
-const authMiddleware = require('../middleware/auth');
+let User, ScannedToken, authMiddleware;
+try {
+  User = require('../models/User');
+  ScannedToken = require('../models/ScannedToken');
+  authMiddleware = require('../middleware/auth');
+} catch (err) {
+  console.error('Error loading models:', err);
+}
 
 const app = express();
 
@@ -15,9 +29,10 @@ app.use(cors());
 app.use(express.json());
 
 // Log environment check
-console.log('[Vercel] MONGO_URI:', process.env.MONGO_URI ? 'SET' : 'MISSING');
-console.log('[Vercel] JWT_SECRET:', process.env.JWT_SECRET ? 'SET' : 'MISSING');
-console.log('[Vercel] QR_HMAC_SECRET:', process.env.QR_HMAC_SECRET ? 'SET' : 'MISSING');
+console.log('[Vercel API] Startup...');
+console.log('[Vercel] MONGO_URI:', process.env.MONGO_URI ? '✅ SET' : '❌ MISSING');
+console.log('[Vercel] JWT_SECRET:', process.env.JWT_SECRET ? '✅ SET' : '❌ MISSING');
+console.log('[Vercel] QR_HMAC_SECRET:', process.env.QR_HMAC_SECRET ? '✅ SET' : '❌ MISSING';
 
 // Connect to MongoDB once
 let mongoConnected = false;
@@ -35,7 +50,19 @@ const connectDB = async () => {
 };
 
 // Health check - note: routes don't need /api prefix on Vercel
-app.get('/health', (_, res) => res.json({ status: 'ok', environment: process.env.NODE_ENV || 'production' }));
+app.get('/health', (_, res) => {
+  const status = {
+    status: 'ok',
+    environment: process.env.NODE_ENV || 'production',
+    mongo: process.env.MONGO_URI ? '✅' : '❌',
+    jwt: process.env.JWT_SECRET ? '✅' : '❌',
+    qr: process.env.QR_HMAC_SECRET ? '✅' : '❌'
+  };
+  res.json(status);
+});
+
+// Root endpoint - simple test
+app.get('/', (_, res) => res.json({ message: 'Chalo Backend API - Test OK', timestamp: new Date() }));
 
 // Auth Routes - routes don't need /api prefix on Vercel
 const bcrypt = require('bcryptjs');
@@ -141,6 +168,20 @@ app.post('/qr/verify', authMiddleware, async (req, res) => {
 app.get('/qr/secret', authMiddleware, (req, res) => {
   if (!process.env.QR_HMAC_SECRET) return res.status(500).json({ error: 'QR_HMAC_SECRET not configured' });
   res.json({ hmacSecret: process.env.QR_HMAC_SECRET });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('API Error:', err);
+  res.status(500).json({ 
+    error: err.message || 'Internal Server Error',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found', path: req.path });
 });
 
 module.exports = app;
