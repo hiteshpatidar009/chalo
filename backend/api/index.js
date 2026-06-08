@@ -2,25 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-
-// Check required env vars immediately
-const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET', 'QR_HMAC_SECRET'];
-const missingVars = requiredEnvVars.filter(v => !process.env[v]);
-
-if (missingVars.length > 0) {
-  console.error('❌ MISSING ENV VARIABLES:', missingVars);
-  console.log('Please set these in Vercel Settings → Environment Variables');
-}
-
-// Models and routes
-let User, ScannedToken, authMiddleware;
-try {
-  User = require('../models/User');
-  ScannedToken = require('../models/ScannedToken');
-  authMiddleware = require('../middleware/auth');
-} catch (err) {
-  console.error('Error loading models:', err);
-}
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 
@@ -28,56 +12,112 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Log environment check
-console.log('[Vercel API] Startup...');
-console.log('[Vercel] MONGO_URI:', process.env.MONGO_URI ? '✅ SET' : '❌ MISSING');
-console.log('[Vercel] JWT_SECRET:', process.env.JWT_SECRET ? '✅ SET' : '❌ MISSING');
-console.log('[Vercel] QR_HMAC_SECRET:', process.env.QR_HMAC_SECRET ? '✅ SET' : '❌ MISSING';
+// Environment variables
+const MONGO_URI = process.env.MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
+const QR_HMAC_SECRET = process.env.QR_HMAC_SECRET;
 
-// Connect to MongoDB once
+// Log environment check
+console.log('[API] ===== STARTUP =====');
+console.log('[API] MONGO_URI:', MONGO_URI ? '✅ SET' : '❌ MISSING');
+console.log('[API] JWT_SECRET:', JWT_SECRET ? '✅ SET' : '❌ MISSING');
+console.log('[API] QR_HMAC_SECRET:', QR_HMAC_SECRET ? '✅ SET' : '❌ MISSING');
+
+// MongoDB Connection
 let mongoConnected = false;
 const connectDB = async () => {
   if (mongoConnected) return;
+  if (!MONGO_URI) throw new Error('MONGO_URI not configured');
+  
   try {
-    if (!process.env.MONGO_URI) throw new Error('MONGO_URI not configured');
-    await mongoose.connect(process.env.MONGO_URI);
+    await mongoose.connect(MONGO_URI, {
+      maxPoolSize: 5,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    });
     mongoConnected = true;
-    console.log('MongoDB connected');
+    console.log('[API] ✅ MongoDB connected');
   } catch (err) {
-    console.error('DB connection error:', err);
+    console.error('[API] ❌ MongoDB error:', err.message);
+    mongoConnected = false;
     throw err;
   }
 };
 
-// Health check - note: routes don't need /api prefix on Vercel
-app.get('/health', (_, res) => {
-  const status = {
-    status: 'ok',
-    environment: process.env.NODE_ENV || 'production',
-    mongo: process.env.MONGO_URI ? '✅' : '❌',
-    jwt: process.env.JWT_SECRET ? '✅' : '❌',
-    qr: process.env.QR_HMAC_SECRET ? '✅' : '❌'
-  };
-  res.json(status);
+// Define Models inline (avoids import errors on Vercel)
+const UserSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  phone: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  dob: { type: String, default: '' },
+  gender: { type: String, default: '' },
+}, { timestamps: true });
+
+const ScannedTokenSchema = new mongoose.Schema({
+  tokenHash: { type: String, required: true, unique: true },
+  userId: String,
+  ticketId: String,
+  createdAt: { type: Date, default: Date.now, expires: 86400 }
 });
 
-// Root endpoint - simple test
-app.get('/', (_, res) => res.json({ message: 'Chalo Backend API - Test OK', timestamp: new Date() }));
+const User = mongoose.model('User', UserSchema);
+const ScannedToken = mongoose.model('ScannedToken', ScannedTokenSchema);
 
-// Auth Routes - routes don't need /api prefix on Vercel
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+// Auth Middleware
+const authMiddleware = (req, res, next) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
+    req.user = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// ========== ROUTES ==========
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'Chalo Backend API ✅',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    environment: process.env.NODE_ENV || 'production',
+    mongo: MONGO_URI ? '✅' : '❌',
+    jwt: JWT_SECRET ? '✅' : '❌',
+    qr: QR_HMAC_SECRET ? '✅' : '❌'
+  });
+});
+
+// ========== AUTH ROUTES ==========
 
 app.post('/auth/register', async (req, res) => {
   try {
     await connectDB();
-    if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET not configured');
-    const { name, phone, password, dob, gender } = req.body;
+    if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
+    
+    const { name, phone, password, dob = '', gender = '' } = req.body;
+    if (!name || !phone || !password) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
     const existing = await User.findOne({ phone });
     if (existing) return res.status(400).json({ error: 'Phone already registered' });
+    
     const hash = await bcrypt.hash(password, 10);
     const user = await User.create({ name, phone, password: hash, dob, gender });
-    const token = jwt.sign({ userId: user._id, name: user.name, phone: user.phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ userId: user._id, name: user.name, phone: user.phone }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user._id, name: user.name, phone: user.phone, dob: user.dob, gender: user.gender } });
   } catch (e) {
     console.error('Register error:', e);
@@ -88,13 +128,20 @@ app.post('/auth/register', async (req, res) => {
 app.post('/auth/login', async (req, res) => {
   try {
     await connectDB();
-    if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET not configured');
+    if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
+    
     const { phone, password } = req.body;
+    if (!phone || !password) {
+      return res.status(400).json({ error: 'Missing phone or password' });
+    }
+
     const user = await User.findOne({ phone });
     if (!user) return res.status(400).json({ error: 'User not found' });
+    
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ error: 'Invalid password' });
-    const token = jwt.sign({ userId: user._id, name: user.name, phone: user.phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    
+    const token = jwt.sign({ userId: user._id, name: user.name, phone: user.phone }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user._id, name: user.name, phone: user.phone, dob: user.dob, gender: user.gender } });
   } catch (e) {
     console.error('Login error:', e);
@@ -102,13 +149,12 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// QR Routes
-const crypto = require('crypto');
+// ========== QR ROUTES ==========
+
 const WINDOW_SECONDS = 30;
 
 function generateQRToken(userId, ticketId, secret) {
   const now = Math.floor(Date.now() / 1000);
-  const window = Math.floor(now / WINDOW_SECONDS);
   const nonce = crypto.randomBytes(8).toString('hex');
 
   const payload = {
@@ -117,7 +163,7 @@ function generateQRToken(userId, ticketId, secret) {
     issuedAt: now,
     expiry: now + WINDOW_SECONDS,
     nonce,
-    window,
+    window: Math.floor(now / WINDOW_SECONDS),
   };
 
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64');
@@ -128,9 +174,9 @@ function generateQRToken(userId, ticketId, secret) {
 
 app.post('/qr/generate', authMiddleware, (req, res) => {
   try {
-    if (!process.env.QR_HMAC_SECRET) throw new Error('QR_HMAC_SECRET not configured');
+    if (!QR_HMAC_SECRET) throw new Error('QR_HMAC_SECRET not configured');
     const { ticketId = 'AICTSL-PASS-001' } = req.body;
-    const result = generateQRToken(req.user.userId, ticketId, process.env.QR_HMAC_SECRET);
+    const result = generateQRToken(req.user.userId, ticketId, QR_HMAC_SECRET);
     res.json(result);
   } catch (e) {
     console.error('QR Generate error:', e);
@@ -141,12 +187,13 @@ app.post('/qr/generate', authMiddleware, (req, res) => {
 app.post('/qr/verify', authMiddleware, async (req, res) => {
   try {
     await connectDB();
-    if (!process.env.QR_HMAC_SECRET) throw new Error('QR_HMAC_SECRET not configured');
+    if (!QR_HMAC_SECRET) throw new Error('QR_HMAC_SECRET not configured');
+    
     const { qrData } = req.body;
     const [payloadB64, sig] = qrData.split('.');
     if (!payloadB64 || !sig) return res.status(400).json({ valid: false, reason: 'Malformed QR' });
 
-    const expectedSig = crypto.createHmac('sha256', process.env.QR_HMAC_SECRET).update(payloadB64).digest('base64');
+    const expectedSig = crypto.createHmac('sha256', QR_HMAC_SECRET).update(payloadB64).digest('base64');
     if (expectedSig !== sig) return res.status(400).json({ valid: false, reason: 'Invalid signature' });
 
     const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString());
@@ -166,13 +213,15 @@ app.post('/qr/verify', authMiddleware, async (req, res) => {
 });
 
 app.get('/qr/secret', authMiddleware, (req, res) => {
-  if (!process.env.QR_HMAC_SECRET) return res.status(500).json({ error: 'QR_HMAC_SECRET not configured' });
-  res.json({ hmacSecret: process.env.QR_HMAC_SECRET });
+  if (!QR_HMAC_SECRET) return res.status(500).json({ error: 'QR_HMAC_SECRET not configured' });
+  res.json({ hmacSecret: QR_HMAC_SECRET });
 });
+
+// ========== ERROR HANDLERS ==========
 
 // Global error handler
 app.use((err, req, res, next) => {
-  console.error('API Error:', err);
+  console.error('[Error]:', err);
   res.status(500).json({ 
     error: err.message || 'Internal Server Error',
     timestamp: new Date().toISOString()
